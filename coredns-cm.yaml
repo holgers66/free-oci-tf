@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:  
+  name: coredns-custom  
+  namespace: kube-system 
+data:
+  k8s-demo.server: | # All custom server files must have a ".server" file extension. 
+    k8s-demo.win {
+      forward . 1.1.1.1
+    }

@@ -1,0 +1,199 @@
+############################################################################################################################################################################################
+
+*** create cluster: see https://arnoldgalovics.com/oracle-cloud-kubernetes-terraform/ ***
+go to /home/remoteusr/free-kubernetes-oracle-cloud-terraform/oci-infra and run tf init; tf plan; tf apply
+to destroy cluster run tf destroy
+- create kubeconfig with command: oci ce cluster create-kubeconfig --cluster-id <cluster OCID> --file ~/.kube/config --region <region> --token-version 2.0.0 --kube-endpoint PUBLIC_ENDPOINT
+
+############################################################################################################################################################################################
+
+############################################################################################################################################################################################
+
+- "replace flannel with cilium: https://medium.com/oracledevs/cni-adventures-with-kubernetes-on-oracle-cloud-cilium-5c6f011746d5"
+
+helm repo add cilium https://helm.cilium.io/
+helm show values cilium/cilium > cilium_values.yaml
+
+- edit cilium_values.yaml as follows:
+
+hubble:
+  tls:
+    enabled: false
+hubble:
+  relay:
+    enabled: true
+hubble:
+  ui:
+    enabled: true
+ipam:
+  mode: "kubernetes"
+
+- install cilium:
+helm install cilium cilium/cilium --namespace=kube-system -f cilium_values.yaml
+
+- install cilium CLI (if not yet done):
+CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/master/stable.txt)
+CLI_ARCH=amd64
+if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+
+- check cilium status: 
+cilium status
+
+- check which pods by using a helper script:
+curl -sLO https://raw.githubusercontent.com/cilium/cilium/master/contrib/k8s/k8s-unmanaged.sh
+chmod +x k8s-unmanaged.sh
+
+- restart pods not managed by cilium and then check again
+
+- delete flannel daemonset: kubectl delete -n kube-system daemonset kube-flannel-ds
+
+- run connectivity test: cilium connectivity test
+- test hubble UI: cilium hubble ui
+
+############################################################################################################################################################################################
+
+############################################################################################################################################################################################
+
+*** install NGINX ingress controller: https://hbayraktar.medium.com/installing-cert-manager-and-nginx-ingress-with-lets-encrypt-on-kubernetes-fe0dff4b1924 ***
+
+helm upgrade --install ingress-nginx ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-nginx --create-namespace \
+   --set controller.service.annotations.service\\.beta\\.kubernetes\\.io/oci-load-balancer-shape=flexible \
+   --set controller.service.annotations.service\\.beta\\.kubernetes\\.io/oci-load-balancer-shape-flex-min=10 \
+   --set controller.service.annotations.service\\.beta\\.kubernetes\\.io/oci-load-balancer-shape-flex-max=10
+
+- deploy a test app:
+kubectl apply -f base-app-deploy.yaml
+
+- create service:
+kubectl apply -f base-svc.yaml
+
+### - create ingress:
+### kubectl apply -f base-ingress.yaml
+
+- check external IP of ingress and set in Cloudflare DNS 
+
+
+############################################################################################################################################################################################
+
+############################################################################################################################################################################################
+
+*** install cert-manager and test let's encrypt ***
+
+- install cert-manager:
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm upgrade --install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --version v1.18.1 \
+  --set extraArgs='{--dns01-recursive-nameservers=1.1.1.1:53}' \
+  --set installCRDs=true
+
+- create clusterissuer and secret for API token:
+kubectl apply -f clusterissuer.yaml
+
+- set up HTTPS ingress:
+kubectl apply -f tls-ingress.yaml
+
+- check if certificate is created:
+kubectl describe certificate example-tls
+kubectl get cert 
+
+- cleanup test app, service and ingress:
+kubectl delete -f base-app-deploy.yaml
+kubectl delete -f base-svc.yaml
+kubectl delete -f tls-ingress.yaml
+
+
+to uninstall cert-manager: https://cert-manager.io/docs/installation/helm/#uninstalling
+helm uninstall cert-manager -n cert-manager
+kubectl delete crd \
+  issuers.cert-manager.io \
+  clusterissuers.cert-manager.io \
+  certificates.cert-manager.io \
+  certificaterequests.cert-manager.io \
+  orders.acme.cert-manager.io \
+  challenges.acme.cert-manager.io
+
+############################################################################################################################################################################################
+
+###########################################################################################################################################################################################
+
+### *** install and configure Core-DNS and External-DNS ***
+
+### - configure CoreDNS to use Cloudflare:
+
+### kubectl apply -f coredns-cm.yaml
+
+### - reload CoreDNS:
+### kubectl delete pod --namespace kube-system -l k8s-app=kube-dns
+
+### - install and configure ExternalDNS: https://github.com/kubernetes-sigs/external-dns/blob/master/docs/tutorials/cloudflare.md
+### - create secret to store Cloudflare API Key:
+### kubectl create secret generic cloudflare-api-key --from-literal=apiKey=1f8911a7bf70c69b78086b464192aae0eaa3e --from-literal=email=holger.schneider@gmail.com 
+
+### helm repo add external-dns https://kubernetes-sigs.github.io/external-dns/
+### helm repo update
+### helm upgrade --install external-dns external-dns/external-dns --values external-dns-values.yaml
+
+### - create test deployment and service:
+###
+### kubectl apply -f external-dns-test.yaml
+
+############################################################################################################################################################################################
+
+
+*** install ArgoCD: https://argo-cd.readthedocs.io/en/stable/getting_started/ ***
+
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+- install argo CLI:
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+rm argocd-linux-amd64
+
+- get initial admin password:
+argocd admin initial-password -n argocd
+
+- change admin password:
+argocd account update-password
+or:
+change in ArgoCD UI under Settings -> Users -> admin
+
+- to create ingress for ArgoCD:
+kubectl apply -f argocd-ingress.yaml
+kubectl apply -f argocd-service.yaml
+
+- create app from Git repo:
+
+create app in ArgoCD UI with the following settings:
+  - Application Name: test
+  - Project: default
+  - Sync Policy: Automatic
+  - Source:
+    - Repository URL: https://github.com/holgers66/argocd-example-apps.git
+    - Revision: HEAD
+    - Path: guestbook
+  - Destination:
+    - Cluster: https://kubernetes.default.svc
+    - Namespace: default
+click create
+
+sync app:
+click on the app in ArgoCD UI and then click Sync
+
+
+############################################################################################################################################################################################
+
+############################################################################################################################################################################################
+
+Cleanup cluster and other resources:
+- move to /home/remoteusr/free-kubernetes-oracle-cloud-terraform/oci-infra and run 'tf destroy'
+
+- delete kubeconfig file: 
+mv ~/.kube/config ~/.kube/config.bak.<date>
